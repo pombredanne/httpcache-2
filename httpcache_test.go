@@ -2,11 +2,12 @@ package httpcache
 
 import (
 	"fmt"
-	. "launchpad.net/gocheck"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	. "launchpad.net/gocheck"
 )
 
 var _ = fmt.Print
@@ -14,9 +15,17 @@ var _ = fmt.Print
 func Test(t *testing.T) { TestingT(t) }
 
 type S struct {
-	listener  net.Listener
+	server    *httptest.Server
 	client    http.Client
 	transport *Transport
+}
+
+type fakeClock struct {
+	elapsed time.Duration
+}
+
+func (c *fakeClock) since(t time.Time) time.Duration {
+	return c.elapsed
 }
 
 var _ = Suite(&S{})
@@ -27,21 +36,18 @@ func (s *S) SetUpSuite(c *C) {
 	s.transport = t
 	s.client = client
 
-	ln, err := net.Listen("tcp", ":9090")
-	if err != nil {
-		panic(err)
-	}
-	s.listener = ln
+	mux := http.NewServeMux()
+	s.server = httptest.NewServer(mux)
 
-	http.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 	}))
 
-	http.HandleFunc("/nostore", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/nostore", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 	}))
 
-	http.HandleFunc("/etag", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/etag", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		etag := "124567"
 		if r.Header.Get("if-none-match") == etag {
 			w.WriteHeader(http.StatusNotModified)
@@ -49,7 +55,7 @@ func (s *S) SetUpSuite(c *C) {
 		w.Header().Set("etag", etag)
 	}))
 
-	http.HandleFunc("/lastmodified", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/lastmodified", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lm := "Fri, 14 Dec 2010 01:01:50 GMT"
 		if r.Header.Get("if-modified-since") == lm {
 			w.WriteHeader(http.StatusNotModified)
@@ -57,48 +63,44 @@ func (s *S) SetUpSuite(c *C) {
 		w.Header().Set("last-modified", lm)
 	}))
 
-	http.HandleFunc("/varyaccept", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/varyaccept", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Vary", "Accept")
 		w.Write([]byte("Some text content"))
 	}))
 
-	http.HandleFunc("/doublevary", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/doublevary", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Vary", "Accept, Accept-Language")
 		w.Write([]byte("Some text content"))
 	}))
-	http.HandleFunc("/varyunused", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/varyunused", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Vary", "X-Madeup-Header")
 		w.Write([]byte("Some text content"))
 	}))
-
-	go http.Serve(s.listener, nil)
 }
 
 func (s *S) TearDownSuite(c *C) {
-	err := s.listener.Close()
-	if err != nil {
-		panic(err)
-	}
+	s.server.Close()
 }
 
 func (s *S) TearDownTest(c *C) {
 	s.transport.Cache = NewMemoryCache()
+	clock = &realClock{}
 }
 
 func (s *S) TestGetOnlyIfCachedHit(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/", nil)
+	req, err := http.NewRequest("GET", s.server.URL, nil)
 	c.Assert(err, IsNil)
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
 	c.Assert(resp.Header.Get(XFromCache), Equals, "")
 
-	req2, err2 := http.NewRequest("GET", "http://localhost:9090/", nil)
+	req2, err2 := http.NewRequest("GET", s.server.URL, nil)
 	req2.Header.Add("cache-control", "only-if-cached")
 	resp2, err2 := s.client.Do(req)
 	defer resp2.Body.Close()
@@ -108,7 +110,7 @@ func (s *S) TestGetOnlyIfCachedHit(c *C) {
 }
 
 func (s *S) TestGetOnlyIfCachedMiss(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/", nil)
+	req, err := http.NewRequest("GET", s.server.URL, nil)
 	req.Header.Add("cache-control", "only-if-cached")
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
@@ -118,7 +120,7 @@ func (s *S) TestGetOnlyIfCachedMiss(c *C) {
 }
 
 func (s *S) TestGetNoStoreRequest(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/", nil)
+	req, err := http.NewRequest("GET", s.server.URL, nil)
 	req.Header.Add("Cache-Control", "no-store")
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
@@ -132,7 +134,7 @@ func (s *S) TestGetNoStoreRequest(c *C) {
 }
 
 func (s *S) TestGetNoStoreResponse(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/nostore", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/nostore", nil)
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
 	c.Assert(err, IsNil)
@@ -145,7 +147,7 @@ func (s *S) TestGetNoStoreResponse(c *C) {
 }
 
 func (s *S) TestGetWithEtag(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/etag", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/etag", nil)
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
 	c.Assert(err, IsNil)
@@ -158,7 +160,7 @@ func (s *S) TestGetWithEtag(c *C) {
 }
 
 func (s *S) TestGetWithLastModified(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/lastmodified", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/lastmodified", nil)
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
 	c.Assert(err, IsNil)
@@ -171,7 +173,7 @@ func (s *S) TestGetWithLastModified(c *C) {
 }
 
 func (s *S) TestGetWithVary(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/varyaccept", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/varyaccept", nil)
 	req.Header.Set("Accept", "text/plain")
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
@@ -197,7 +199,7 @@ func (s *S) TestGetWithVary(c *C) {
 }
 
 func (s *S) TestGetWithDoubleVary(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/doublevary", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/doublevary", nil)
 	req.Header.Set("Accept", "text/plain")
 	req.Header.Set("Accept-Language", "da, en-gb;q=0.8, en;q=0.7")
 	resp, err := s.client.Do(req)
@@ -224,7 +226,7 @@ func (s *S) TestGetWithDoubleVary(c *C) {
 }
 
 func (s *S) TestGetVaryUnused(c *C) {
-	req, err := http.NewRequest("GET", "http://localhost:9090/varyunused", nil)
+	req, err := http.NewRequest("GET", s.server.URL+"/varyunused", nil)
 	req.Header.Set("Accept", "text/plain")
 	resp, err := s.client.Do(req)
 	defer resp.Body.Close()
@@ -245,11 +247,16 @@ func (s *S) TestParseCacheControl(c *C) {
 
 	h.Set("cache-control", "no-cache")
 	cc := parseCacheControl(h)
-	c.Assert(cc["no-cache"], Equals, "1")
+	if _, ok := cc["foo"]; ok {
+		c.Error("Value shouldn't exist")
+	}
+	if nocache, ok := cc["no-cache"]; ok {
+		c.Assert(nocache, Equals, "")
+	}
 
 	h.Set("cache-control", "no-cache, max-age=3600")
 	cc = parseCacheControl(h)
-	c.Assert(cc["no-cache"], Equals, "1")
+	c.Assert(cc["no-cache"], Equals, "")
 	c.Assert(cc["max-age"], Equals, "3600")
 }
 
@@ -298,7 +305,7 @@ func (s *S) TestFreshExpiration(c *C) {
 	reqHeaders := http.Header{}
 	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
 
-	time.Sleep(3 * time.Second)
+	clock = &fakeClock{elapsed: 3 * time.Second}
 	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, stale)
 }
 
@@ -311,7 +318,7 @@ func (s *S) TestMaxAge(c *C) {
 	reqHeaders := http.Header{}
 	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
 
-	time.Sleep(3 * time.Second)
+	clock = &fakeClock{elapsed: 3 * time.Second}
 	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, stale)
 }
 
@@ -348,5 +355,44 @@ func (s *S) TestMinFreshWithExpires(c *C) {
 
 	reqHeaders = http.Header{}
 	reqHeaders.Set("cache-control", "min-fresh=2")
+	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, stale)
+}
+
+func (s *S) TestEmptyMaxStale(c *C) {
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=20")
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("cache-control", "max-stale")
+
+	clock = &fakeClock{elapsed: 10 * time.Second}
+
+	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
+
+	clock = &fakeClock{elapsed: 60 * time.Second}
+
+	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
+}
+
+func (s *S) TestMaxStaleValue(c *C) {
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=10")
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("cache-control", "max-stale=20")
+	clock = &fakeClock{elapsed: 5 * time.Second}
+
+	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
+
+	clock = &fakeClock{elapsed: 15 * time.Second}
+
+	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, fresh)
+
+	clock = &fakeClock{elapsed: 30 * time.Second}
+
 	c.Assert(getFreshness(respHeaders, reqHeaders), Equals, stale)
 }

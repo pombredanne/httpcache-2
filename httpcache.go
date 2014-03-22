@@ -4,12 +4,12 @@
 // It is only suitable for use as a 'private' cache (i.e. for a web-browser or an API-client
 // and not for a shared proxy).
 //
-// 'max-stale' set on a request is not currently respected. (max-age and min-fresh both are.)
 package httpcache
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -21,7 +21,7 @@ const (
 	stale = iota
 	fresh
 	transparent
-	// Header added to responses that are returned from the cache
+	// XFromCache is the header added to responses that are returned from the cache
 	XFromCache = "X-From-Cache"
 )
 
@@ -59,6 +59,7 @@ type MemoryCache struct {
 	items map[string][]byte
 }
 
+// Get returns the []byte representation of the response and true if present, false if not
 func (c *MemoryCache) Get(key string) (resp []byte, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -66,12 +67,14 @@ func (c *MemoryCache) Get(key string) (resp []byte, ok bool) {
 	return resp, ok
 }
 
+// Set saves response resp to the cache with key
 func (c *MemoryCache) Set(key string, resp []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[key] = resp
 }
 
+// Delete removes key from the cache
 func (c *MemoryCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -100,6 +103,11 @@ type Transport struct {
 // provided Cache implementation and MarkCachedResponses set to true
 func NewTransport(c Cache) *Transport {
 	return &Transport{Cache: c, MarkCachedResponses: true}
+}
+
+// Client returns an *http.Client that caches responses.
+func (t *Transport) Client() *http.Client {
+	return &http.Client{Transport: t}
 }
 
 // varyMatches will return false unless all of the cached values for the headers listed in Vary
@@ -180,6 +188,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			if err != nil || resp.StatusCode != http.StatusOK {
 				t.Cache.Delete(cacheKey)
 			}
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		reqCacheControl := parseCacheControl(req.Header)
@@ -187,8 +198,12 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			resp = newGatewayTimeoutResponse(req)
 		} else {
 			resp, err = transport.RoundTrip(req)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
+
 	reqCacheControl := parseCacheControl(req.Header)
 	respCacheControl := parseCacheControl(resp.Header)
 
@@ -212,6 +227,32 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	return resp, nil
 }
 
+// ErrNoDateHeader indicates that the HTTP headers contained no Date header.
+var ErrNoDateHeader = errors.New("no Date header")
+
+// Date parses and returns the value of the Date header.
+func Date(respHeaders http.Header) (date time.Time, err error) {
+	dateHeader := respHeaders.Get("date")
+	if dateHeader == "" {
+		err = ErrNoDateHeader
+		return
+	}
+
+	return time.Parse(time.RFC1123, dateHeader)
+}
+
+type realClock struct{}
+
+func (c *realClock) since(d time.Time) time.Duration {
+	return time.Since(d)
+}
+
+type timer interface {
+	since(d time.Time) time.Duration
+}
+
+var clock timer = &realClock{}
+
 // getFreshness will return one of fresh/stale/transparent based on the cache-control
 // values of the request and the response
 //
@@ -221,8 +262,6 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 //
 // Because this is only a private cache, 'public' and 'private' in cache-control aren't
 // signficant. Similarly, smax-age isn't used.
-//
-// Limitation: max-stale is not taken into account. It should be.
 func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	respCacheControl := parseCacheControl(respHeaders)
 	reqCacheControl := parseCacheControl(reqHeaders)
@@ -235,54 +274,72 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	if _, ok := reqCacheControl["only-if-cached"]; ok {
 		return fresh
 	}
-	dateHeader := respHeaders.Get("date")
-	if dateHeader != "" {
-		date, err := time.Parse(time.RFC1123, dateHeader)
+
+	date, err := Date(respHeaders)
+	if err != nil {
+		return stale
+	}
+	currentAge := clock.since(date)
+
+	var lifetime time.Duration
+	var zeroDuration time.Duration
+
+	// If a response includes both an Expires header and a max-age directive,
+	// the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
+	if maxAge, ok := respCacheControl["max-age"]; ok {
+		lifetime, err = time.ParseDuration(maxAge + "s")
 		if err != nil {
-			return stale
+			lifetime = zeroDuration
 		}
-		currentAge := time.Since(date)
-		var lifetime time.Duration
-		zeroDuration, _ := time.ParseDuration("0s")
-		// If a response includes both an Expires header and a max-age directive,
-		// the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
-		if maxAge, ok := respCacheControl["max-age"]; ok {
-			lifetime, err = time.ParseDuration(maxAge + "s")
+	} else {
+		expiresHeader := respHeaders.Get("Expires")
+		if expiresHeader != "" {
+			expires, err := time.Parse(time.RFC1123, expiresHeader)
 			if err != nil {
 				lifetime = zeroDuration
-			}
-		} else {
-			expiresHeader := respHeaders.Get("Expires")
-			if expiresHeader != "" {
-				expires, err := time.Parse(time.RFC1123, expiresHeader)
-				if err != nil {
-					lifetime = zeroDuration
-				} else {
-					lifetime = expires.Sub(date)
-				}
+			} else {
+				lifetime = expires.Sub(date)
 			}
 		}
+	}
 
-		if maxAge, ok := reqCacheControl["max-age"]; ok {
-			// the client is willing to accept a response whose age is no greater than the specified time in seconds
-			lifetime, err = time.ParseDuration(maxAge + "s")
-			if err != nil {
-				lifetime = zeroDuration
-			}
+	if maxAge, ok := reqCacheControl["max-age"]; ok {
+		// the client is willing to accept a response whose age is no greater than the specified time in seconds
+		lifetime, err = time.ParseDuration(maxAge + "s")
+		if err != nil {
+			lifetime = zeroDuration
 		}
-		if minfresh, ok := reqCacheControl["min-fresh"]; ok {
-			//  the client wants a response that will still be fresh for at least the specified number of seconds.
-			minfreshDuration, err := time.ParseDuration(minfresh + "s")
-			if err == nil {
-				currentAge = time.Duration(currentAge + minfreshDuration)
-			}
+	}
+	if minfresh, ok := reqCacheControl["min-fresh"]; ok {
+		//  the client wants a response that will still be fresh for at least the specified number of seconds.
+		minfreshDuration, err := time.ParseDuration(minfresh + "s")
+		if err == nil {
+			currentAge = time.Duration(currentAge + minfreshDuration)
 		}
+	}
 
-		if lifetime > currentAge {
+	if maxstale, ok := reqCacheControl["max-stale"]; ok {
+		// Indicates that the client is willing to accept a response that has exceeded its expiration time.
+		// If max-stale is assigned a value, then the client is willing to accept a response that has exceeded
+		// its expiration time by no more than the specified number of seconds.
+		// If no value is assigned to max-stale, then the client is willing to accept a stale response of any age.
+		//
+		// Responses served only because of a max-stale value are supposed to have a Warning header added to them,
+		// but that seems like a  hassle, and is it actually useful? If so, then there needs to be a different
+		// return-value available here.
+		if maxstale == "" {
 			return fresh
 		}
-
+		maxstaleDuration, err := time.ParseDuration(maxstale + "s")
+		if err == nil {
+			currentAge = time.Duration(currentAge - maxstaleDuration)
+		}
 	}
+
+	if lifetime > currentAge {
+		return fresh
+	}
+
 	return stale
 }
 
@@ -348,7 +405,7 @@ func parseCacheControl(headers http.Header) cacheControl {
 			keyval := strings.Split(part, "=")
 			cc[strings.Trim(keyval[0], " ")] = strings.Trim(keyval[1], ",")
 		} else {
-			cc[part] = "1"
+			cc[part] = ""
 		}
 	}
 	return cc
